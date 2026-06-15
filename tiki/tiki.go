@@ -1,62 +1,77 @@
 // Package tiki is the library behind the tiki command line:
-// the HTTP client, request shaping, and the typed data models for tiki.
+// the HTTP client, JSON API parsing, and typed data models for Tiki
+// (tiki.vn), Vietnam's leading e-commerce marketplace.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// Tiki exposes a public JSON REST API for product listings, product details,
+// customer reviews, and the category tree. No API key is required.
+// Product URLs follow the pattern: https://tiki.vn/{url_key}/p{id}.html.
 package tiki
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to tiki. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "tiki/dev (+https://github.com/tamnd/tiki-cli)"
+// Host is the canonical site hostname.
+const Host = "tiki.vn"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at tiki.com; change it once you
-// know the real endpoints you want to read.
-const Host = "tiki.com"
+// baseURL is the site root.
+const baseURL = "https://tiki.vn"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// apiBase is the root of the public JSON API.
+const apiBase = "https://tiki.vn/api/v2"
 
-// Client talks to tiki over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// DefaultUserAgent identifies this client to Tiki.
+const DefaultUserAgent = "tiki-cli/0.1.0 (+https://github.com/tamnd/tiki-cli)"
+
+// Config holds the tunable knobs for the HTTP client.
+type Config struct {
+	BaseURL   string
+	APIBase   string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible production defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   baseURL,
+		APIBase:   apiBase,
+		Rate:      time.Second,
+		Retries:   3,
+		Timeout:   30 * time.Second,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the Tiki API over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	last time.Time
+}
+
+// NewClient returns a Client from DefaultConfig.
+func NewClient() *Client { return NewClientWithConfig(DefaultConfig()) }
+
+// NewClientWithConfig returns a Client built from cfg.
+func NewClientWithConfig(cfg Config) *Client {
+	return &Client{cfg: cfg, http: &http.Client{Timeout: cfg.Timeout}}
+}
+
+// Get fetches rawURL and returns the body bytes, pacing and retrying on transient errors.
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +79,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +88,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -98,18 +114,14 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	}
 
 	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
+	return b, err != nil, err
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -123,78 +135,336 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on tiki.com. It is a stand-in for the typed records you
-// will model from the real tiki endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `tiki cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- wire types (match Tiki API JSON field names) ---
+
+type wireProductList struct {
+	Data   []wireProduct `json:"data"`
+	Paging wirePaging    `json:"paging"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+type wirePaging struct {
+	Total   int `json:"total"`
+	PerPage int `json:"per_page"`
+	Page    int `json:"current_page"`
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
+type wireProduct struct {
+	ID              int64          `json:"id"`
+	SKU             string         `json:"sku"`
+	Name            string         `json:"name"`
+	URLKey          string         `json:"url_key"`
+	ShortDesc       string         `json:"short_description"`
+	Price           float64        `json:"price"`
+	ListPrice       float64        `json:"list_price"`
+	DiscountRate    int            `json:"discount_rate"`
+	RatingAverage   float64        `json:"rating_average"`
+	ReviewCount     int            `json:"review_count"`
+	SoldCount       int64          `json:"all_time_quantity_sold"`
+	QuantitySold    int64          `json:"quantity_sold"`
+	BrandID         int64          `json:"brand_id"`
+	BrandName       string         `json:"brand_name"`
+	SellerID        int64          `json:"seller_id"`
+	SellerName      string         `json:"seller_name"`
+	IsOfficialStore bool           `json:"is_official_store"`
+	IsTikiTrading   bool           `json:"is_tiki_trading"`
+	FulfillmentType string         `json:"fulfillment_type"`
+	Categories      []wireCategory `json:"breadcrumbs"`
+	Images          []wireImage    `json:"images"`
+	Badges          []wireBadge    `json:"badges_v3"`
+	Specifications  []wireSpec     `json:"specifications"`
+	StockItemQty    int            `json:"stock_item"`
+	HasWarranty     bool           `json:"has_warranty"`
+	WarrantyPeriod  string         `json:"warranty_period"`
+}
+
+type wireCategory struct {
+	ID   int64  `json:"category_id"`
+	Name string `json:"name"`
+}
+
+type wireImage struct {
+	BaseURL string `json:"base_url"`
+}
+
+type wireBadge struct {
+	Text string `json:"text"`
+}
+
+type wireSpec struct {
+	Name       string         `json:"name"`
+	Attributes []wireSpecAttr `json:"attributes"`
+}
+
+type wireSpecAttr struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type wireReviewList struct {
+	Data   []wireReview `json:"data"`
+	Paging wirePaging   `json:"paging"`
+}
+
+type wireReview struct {
+	ID           int64           `json:"id"`
+	ProductID    int64           `json:"product_id"`
+	Rating       int             `json:"rating"`
+	Title        string          `json:"title"`
+	Content      string          `json:"content"`
+	CustomerID   int64           `json:"created_by_id"`
+	CustomerName string          `json:"created_by_name"`
+	CreatedAt    int64           `json:"created_at"`
+	HelpfulCount int             `json:"thank_count"`
+	Images       []wireImage     `json:"images"`
+	Attributes   json.RawMessage `json:"attributes"`
+}
+
+type wireCategoryTree struct {
+	Data []wireCatNode `json:"data"`
+}
+
+type wireCatNode struct {
+	ID       int64          `json:"id"`
+	Name     string         `json:"name"`
+	URLKey   string         `json:"url_key"`
+	Children []wireCatNode  `json:"children"`
+}
+
+// --- public types ---
+
+// Product is one Tiki product from the API.
+type Product struct {
+	ID              string  `json:"id"                         kit:"id" table:"id"`
+	SKU             string  `json:"sku,omitempty"                       table:"sku"`
+	Name            string  `json:"name"                                table:"name"`
+	URL             string  `json:"url,omitempty"                       table:"url,url"`
+	ShortDesc       string  `json:"short_description,omitempty"         table:"-"`
+	Price           float64 `json:"price"                               table:"price"`
+	ListPrice       float64 `json:"list_price,omitempty"                table:"list_price"`
+	DiscountRate    int     `json:"discount_rate,omitempty"             table:"discount_rate"`
+	BrandName       string  `json:"brand_name,omitempty"                table:"brand_name"`
+	SellerName      string  `json:"seller_name,omitempty"               table:"seller_name"`
+	IsOfficialStore bool    `json:"is_official_store,omitempty"         table:"official_store"`
+	IsTikiTrading   bool    `json:"is_tiki_trading,omitempty"           table:"tiki_trading"`
+	RatingAverage   float64 `json:"rating_average,omitempty"            table:"rating"`
+	ReviewCount     int     `json:"review_count,omitempty"              table:"reviews"`
+	SoldCount       int64   `json:"sold_count,omitempty"                table:"sold"`
+	FulfillmentType string  `json:"fulfillment_type,omitempty"          table:"fulfillment"`
+	WarrantyPeriod  string  `json:"warranty_period,omitempty"           table:"warranty"`
+	FetchedAt       string  `json:"fetched_at,omitempty"                table:"fetched_at"`
+}
+
+// Review is one customer review for a Tiki product.
+type Review struct {
+	ID           string `json:"id"                    kit:"id" table:"id"`
+	ProductID    string `json:"product_id"                      table:"product_id"`
+	Rating       int    `json:"rating"                          table:"rating"`
+	Title        string `json:"title,omitempty"                 table:"title"`
+	Content      string `json:"content,omitempty"               table:"-"`
+	CustomerName string `json:"customer_name,omitempty"         table:"customer_name"`
+	CreatedAt    string `json:"created_at,omitempty"            table:"created_at"`
+	HelpfulCount int    `json:"helpful_count,omitempty"         table:"helpful"`
+	FetchedAt    string `json:"fetched_at,omitempty"            table:"fetched_at"`
+}
+
+// Category is one node in the Tiki category tree.
+type Category struct {
+	ID     string `json:"id"     kit:"id" table:"id"`
+	Name   string `json:"name"            table:"name"`
+	URLKey string `json:"url_key"         table:"url_key"`
+	URL    string `json:"url"             table:"url,url"`
+}
+
+// --- client methods ---
+
+// GetProduct fetches full details for a single product by ID.
+func (c *Client) GetProduct(ctx context.Context, id string) (*Product, error) {
+	apiURL := c.cfg.APIBase + "/products/" + id
+	body, err := c.Get(ctx, apiURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("product %s: %w", id, err)
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
+	var wire wireProduct
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("decode product %s: %w", id, err)
+	}
+	return productFromWire(wire, c.cfg.BaseURL), nil
+}
+
+// ListProducts fetches products for a category, sorted by the given field.
+// sort is one of "top_seller", "newest", "price_asc", "price_desc". Empty uses default.
+func (c *Client) ListProducts(ctx context.Context, categoryID string, sort string, limit int) ([]*Product, error) {
+	if limit <= 0 {
+		limit = 40
+	}
+	base := c.cfg.APIBase
+	if base == "" {
+		base = apiBase
+	}
+
+	params := url.Values{}
+	params.Set("limit", strconv.Itoa(min(limit, 40)))
+	params.Set("page", "1")
+	if categoryID != "" {
+		params.Set("category", categoryID)
+	}
+	if sort != "" {
+		params.Set("sort", sort)
+	}
+	apiURL := base + "/products?" + params.Encode()
+
+	body, err := c.Get(ctx, apiURL)
+	if err != nil {
+		return nil, fmt.Errorf("products: %w", err)
+	}
+
+	var list wireProductList
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, fmt.Errorf("decode products: %w", err)
+	}
+
+	siteBase := c.cfg.BaseURL
+	if siteBase == "" {
+		siteBase = baseURL
+	}
+	out := make([]*Product, 0, len(list.Data))
+	for _, w := range list.Data {
+		if len(out) >= limit {
 			break
 		}
+		out = append(out, productFromWire(w, siteBase))
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+// ListReviews fetches customer reviews for a product.
+func (c *Client) ListReviews(ctx context.Context, productID string, limit int) ([]*Review, error) {
+	if limit <= 0 {
+		limit = 20
 	}
-	return out
+	base := c.cfg.APIBase
+	if base == "" {
+		base = apiBase
+	}
+
+	params := url.Values{}
+	params.Set("product_id", productID)
+	params.Set("limit", strconv.Itoa(min(limit, 20)))
+	params.Set("page", "1")
+	params.Set("sort", "relevant")
+	apiURL := base + "/reviews?" + params.Encode()
+
+	body, err := c.Get(ctx, apiURL)
+	if err != nil {
+		return nil, fmt.Errorf("reviews for %s: %w", productID, err)
+	}
+
+	var list wireReviewList
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, fmt.Errorf("decode reviews: %w", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	out := make([]*Review, 0, len(list.Data))
+	for _, w := range list.Data {
+		if len(out) >= limit {
+			break
+		}
+		out = append(out, reviewFromWire(w, productID, now))
+	}
+	return out, nil
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// ListCategories fetches the top-level Tiki category tree.
+func (c *Client) ListCategories(ctx context.Context) ([]*Category, error) {
+	base := c.cfg.APIBase
+	if base == "" {
+		base = apiBase
 	}
-	return s
+	apiURL := base + "/categories?include=children"
+	body, err := c.Get(ctx, apiURL)
+	if err != nil {
+		return nil, fmt.Errorf("categories: %w", err)
+	}
+
+	var tree wireCategoryTree
+	if err := json.Unmarshal(body, &tree); err != nil {
+		return nil, fmt.Errorf("decode categories: %w", err)
+	}
+
+	siteBase := c.cfg.BaseURL
+	if siteBase == "" {
+		siteBase = baseURL
+	}
+	var out []*Category
+	for _, node := range tree.Data {
+		out = append(out, categoryFromWire(node, siteBase))
+	}
+	return out, nil
+}
+
+// --- wire → public conversions ---
+
+func productFromWire(w wireProduct, siteBase string) *Product {
+	if siteBase == "" {
+		siteBase = baseURL
+	}
+	productURL := ""
+	if w.URLKey != "" && w.ID > 0 {
+		productURL = siteBase + "/" + w.URLKey + "/p" + strconv.FormatInt(w.ID, 10) + ".html"
+	}
+	return &Product{
+		ID:              strconv.FormatInt(w.ID, 10),
+		SKU:             w.SKU,
+		Name:            w.Name,
+		URL:             productURL,
+		ShortDesc:       w.ShortDesc,
+		Price:           w.Price,
+		ListPrice:       w.ListPrice,
+		DiscountRate:    w.DiscountRate,
+		BrandName:       w.BrandName,
+		SellerName:      w.SellerName,
+		IsOfficialStore: w.IsOfficialStore,
+		IsTikiTrading:   w.IsTikiTrading,
+		RatingAverage:   w.RatingAverage,
+		ReviewCount:     w.ReviewCount,
+		SoldCount:       w.SoldCount,
+		FulfillmentType: w.FulfillmentType,
+		WarrantyPeriod:  w.WarrantyPeriod,
+		FetchedAt:       time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+func reviewFromWire(w wireReview, productID, now string) *Review {
+	createdAt := ""
+	if w.CreatedAt > 0 {
+		createdAt = time.Unix(w.CreatedAt, 0).UTC().Format(time.RFC3339)
+	}
+	return &Review{
+		ID:           strconv.FormatInt(w.ID, 10),
+		ProductID:    productID,
+		Rating:       w.Rating,
+		Title:        strings.TrimSpace(w.Title),
+		Content:      strings.TrimSpace(w.Content),
+		CustomerName: strings.TrimSpace(w.CustomerName),
+		CreatedAt:    createdAt,
+		HelpfulCount: w.HelpfulCount,
+		FetchedAt:    now,
+	}
+}
+
+func categoryFromWire(node wireCatNode, siteBase string) *Category {
+	return &Category{
+		ID:     strconv.FormatInt(node.ID, 10),
+		Name:   node.Name,
+		URLKey: node.URLKey,
+		URL:    siteBase + "/" + node.URLKey + "/c" + strconv.FormatInt(node.ID, 10),
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
